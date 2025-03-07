@@ -158,7 +158,8 @@ function Find-AllPersistence {
       'BootExecute',
       'NetshHelperDLL',
       'SetupExecute',
-      'PlatformExecute'
+      'PlatformExecute',
+      'LibraryAbuseCOM'
     )]
     $PersistenceMethod = 'All',
      
@@ -2293,6 +2294,57 @@ function Find-AllPersistence {
         Write-Verbose -Message ''    
     }
 
+    function Get-LibraryAbuseCOM {
+      Write-Verbose -Message "$hostname - Checking if users' start menu folder contains .library-ms or junction folder artifacts..."
+      $userDirectories = Get-ChildItem -Path "$env:SystemDrive:\Users\"
+      foreach ($directory in $userDirectories) {
+        $fullPath = $directory.FullName
+        $starMenuDirectory = Get-ChildItem -Path "$fullPath\AppData\Roaming\Microsoft\Windows\Start Menu\" -Recurse -ErrorAction SilentlyContinue  
+        foreach ($entry in $starMenuDirectory) {
+          $CLSID = $null
+          $entryName = $entry.Name
+          $entryPath = $entry.FullName
+          
+          $match = [regex]::Match($entryName, "\.\{[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\}", [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+          if ($entry.PSIsContainer -and $match.Success) {
+            Write-Verbose -Message "$hostname - [!] Found a folder: $entryPath!"
+            $matchPattern = $match.Value
+            $CLSID = $matchPattern.Substring(1, $matchPattern.length-1)
+          }
+
+          if (!$entry.PSIsContainer -and $entryName.ToLower().EndsWith('.library-ms')) {
+            $fileContent = Get-Content -Path $entryPath
+            $match = [regex]::Match($fileContent, "\<url\>.*(shell:::|knownfolder:::|\.)\{[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\}\<\/url\>", [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($match.Success) {
+              Write-Verbose -Message "$hostname - [!] Found a file: $entryPath!"
+              $matchPattern = $match.Value
+              $clsidMatch = [regex]::Match($matchPattern, "\{[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\}", [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+              $CLSID = $clsidMatch.Value
+            }
+          }
+          if ($null -ne $CLSID) {
+            $objUser = New-Object System.Security.Principal.NTAccount($hostname, $directory.Name)
+            $userID = $objUser.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            if ($null -ne $userID -or $userID -ne "") {
+              $rootPath = "Registry::HKEY_USERS\$userID"
+            }
+            else {
+              $rootPath = "Registry::HKEY_LOCAL_MACHINE"
+            }
+            $dll = Get-CLSIDPayload -RootPath $rootPath -CLSID $CLSID
+            if ($dll -ne "") {
+              $value = $dll
+            }
+            else {
+              $value = $CLSID
+            }
+            $PersistenceObject = New-PersistenceObject -Hostname $hostname -Technique 'Library Abuse COM' -Classification 'MITRE ATT&CK T1546.015' -Path "$entryPath" -Value "$value" -AccessGained 'User' -Note "The library file or junction folder under .\AppData\Roaming\Microsoft\Windows\Start Menu\ in a user's folder is accessed by explorer.exe every time that user logs in and interacts with the Start Menu. This behavior could be abused to achieve persistence using the Component Object Model." -Reference 'https://attack.mitre.org/techniques/T1546/015/'
+            $null = $persistenceObjectArray.Add($PersistenceObject)
+          }
+        }
+      } 
+      Write-Verbose -Message ''
+    }
 
     function Out-EventLog {
 
@@ -2366,6 +2418,7 @@ function Find-AllPersistence {
           'NetshHelperDLL'                                            = $null
           'SetupExecute'                                              = $null
           'PlatformExecute'                                           = $null
+          'LibraryAbuseCOM'                                           = $null
         }
 
         # Collect the keys in a separate list
@@ -2457,7 +2510,8 @@ function Find-AllPersistence {
       Get-NetshHelperDLL                                            
       Get-SetupExecute                                            
       Get-PlatformExecute                                          
-      
+      Get-LibraryAbuseCOM
+
       if ($IncludeHighFalsePositivesChecks.IsPresent) {
         Write-Verbose -Message "$hostname - You have used the -IncludeHighFalsePositivesChecks switch, this may generate a lot of false positives since it includes checks with results which are difficult to filter programmatically..."
         Get-AppPaths
@@ -2705,6 +2759,10 @@ function Find-AllPersistence {
           Get-PlatformExecute
           break
         }      
+        'LibraryAbuseCOM' {
+          Get-LibraryAbuseCOM
+          break
+        }   
       }
     }      
         
