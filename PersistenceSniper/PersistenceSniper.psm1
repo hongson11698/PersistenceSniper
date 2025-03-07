@@ -397,7 +397,85 @@ function Find-AllPersistence {
         return $false
       }
     }
-    
+    function Get-APPID {
+      param(
+        [String]
+        $RootPath = $null,
+        [String]
+        $AppCLSID = $null
+      )
+  
+      $appName = ""
+  
+      if ($null -ne $AppCLSID) {
+        $appIDList = Get-ItemProperty "$RootPath\Software\Classes\appid\*"
+        foreach ($app in $appIDList) {
+          if ($null -ne $app.AppID -and $app.AppID -eq $AppCLSID) {
+            $appName = $app.PsChildName
+            break
+          }
+        }    
+      }
+      return $appName
+    }
+    function Get-CLSIDPayload {
+      param(
+        [String]
+        $RootPath = $null,
+        [String]
+        $CLSID = $null
+      )
+  
+      $dll = ""
+      
+      $registryKey = (Get-ItemProperty "$rootPath\Software\Classes\CLSID\$CLSID\InprocServer32") 
+      if ($null -eq $registryKey) {
+        $registryKey = (Get-ItemProperty "$rootPath\Software\Classes\CLSID\$CLSID\LocalServer32") 
+      }
+      if ($null -eq $registryKey) {
+        $registryKey = (Get-ItemProperty "Registry::HKEY_LOCAL_MACHINE\Software\Classes\CLSID\$CLSID\InprocServer32") 
+      }
+      if ($null -eq $registryKey) {
+        $registryKey = (Get-ItemProperty "Registry::HKEY_LOCAL_MACHINE\Software\Classes\CLSID\$CLSID\LocalServer32") 
+      }
+  
+      if ($null -eq $registryKey) {
+        $appName = ""
+        $AppId = (Get-ItemProperty "$rootPath\Software\Classes\CLSID\$CLSID")."AppId"
+        if ($null -ne $AppId) {
+          if (-not $AppId.Contains("{")) {
+            $AppId = "{$AppId}"
+          }
+          $appName = Get-APPID -RootPath $rootPath -CLSID $AppId
+                     
+        }
+        else {
+          $AppId = (Get-ItemProperty "Registry::HKEY_LOCAL_MACHINE\Software\Classes\CLSID\$CLSID")."AppId"
+          if ($null -ne $AppId) {
+            if (-not $AppId.Contains("{")) {
+              $AppId = "{$AppId}"
+            }
+            $appName = Get-APPID -RootPath "Registry::HKEY_LOCAL_MACHINE" -AppCLSID $AppId 
+          }
+        }
+  
+        if ($appName -ne "") {
+          $dll = $appName
+        }
+             
+      }
+  
+      else {
+        $dll = $registryKey.'(default)'
+                  
+        if ($null -ne $dll) {
+          if ($dll.EndsWith("mscoree.dll") -and $null -ne $registryKey.'CodeBase' -and $registryKey.'CodeBase' -ne "") {
+            $dll = $registryKey.'CodeBase'
+          }
+        }
+      }
+      return $dll
+    }
     function Parse-NetUser {
       <#
           .SYNOPSIS
@@ -1628,25 +1706,99 @@ function Find-AllPersistence {
     }
     
     function Get-ScheduledTasks {
+  
       Write-Verbose -Message "$hostname - Getting scheduled tasks"
-      $tasks = Get-ScheduledTask
-      if ($tasks) {
-        foreach ($task in $tasks) {
-          $propPath = $task.TaskPath
-          $propPath += $task.TaskName
-          $path = ($task.Actions).Execute + " " + ($task.Actions).Arguments
-          if ($task.UserId -eq 'SYSTEM') {
+  
+      $tasksPath = "$env:windir\System32\Tasks"   
+  
+      $taskFileList = Get-ChildItem -Path $tasksPath -Recurse | Where-Object { ! $_.PSIsContainer } 
+  
+      $ErrorActionPreference = "SilentlyContinue"
+  
+      foreach ($taskFile in $taskFileList) {
+            
+        [xml] $xmlTask = Get-Content $taskFile.FullName
+      
+        $propPath = $taskFile.FullName.Replace($tasksPath, "")
+  
+        if ($null -ne $xmlTask.Task.Principals.Principal.UserId) {
+          $userID = $xmlTask.Task.Principals.Principal.UserId
+          if (($userID -eq 'SYSTEM') -or ($userID -eq 'S-1-5-18') -or ($userID -eq 'S-1-5-19') -or ($userID -eq 'S-1-5-20')) {
             $access = 'System'
           }
           else {
             $access = 'User'
           }
+        }
+        elseif ($null -ne $xmlTask.Task.Principals.Principal.GroupId) {
+          $groupID = $xmlTask.Task.Principals.Principal.GroupId
+          if (($groupID -eq 'SYSTEM') -or ($groupID -eq 'S-1-5-18') -or ($groupID -eq 'S-1-5-19') -or ($groupID -eq 'S-1-5-20')) {
+            $access = 'System'
+          }
+          else {
+            $access = 'User'
+          }
+        }
+        else {
+          $access = "Unknow"
+        }
+  
+        if ($null -ne $xmlTask.Task.Actions.Exec.Command) {
+          $command = $xmlTask.Task.Actions.Exec.Command
+          $value = $command + " " + $xmlTask.Task.Actions.Exec.Arguments
+        }
+  
+        elseif ($null -ne $xmlTask.Task.Actions.ComHandler.ClassId) {
+          $ClassId = $xmlTask.Task.Actions.ComHandler.ClassId
+          if (-not $ClassId.Contains("{")) {
+            $ClassId = "{$ClassId}"
+          }
           
-          $PersistenceObject = New-PersistenceObject -Hostname $hostname -Technique 'Scheduled Task' -Classification 'MITRE ATT&CK T1053.005' -Path $propPath -Value $path -AccessGained $access -Note "Scheduled tasks run executables or actions when certain conditions, such as user log in or machine boot up, are met." -Reference 'https://attack.mitre.org/techniques/T1053/005/'
-          $null = $persistenceObjectArray.Add($PersistenceObject)
-        } 
+          $rootPath = $null
+  
+          if ($access -eq "System") {
+            $rootPath = "Registry::HKEY_LOCAL_MACHINE"
+          }
+              
+          elseif ($null -ne $userID) {
+            if ($userID.Contains("\")) {
+              $domain, $username = $userID.Split("\", 2)
+              $objUser = New-Object System.Security.Principal.NTAccount($domain, $username)
+              $userID = $objUser.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+            $rootPath = "Registry::HKEY_USERS\$userID"
+  
+          }
+          elseif ($null -ne $groupID) {
+            if ($groupID.Contains("\")) {
+              $domain, $username = $userID.Split("\", 2)
+              $objUser = New-Object System.Security.Principal.NTAccount($domain, $username)
+              $groupID = $objUser.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+            $rootPath = "Registry::HKEY_USERS\$groupID"
+          }
+      
+          if ($null -ne $rootPath) {
+            $dll = Get-CLSIDPayload -RootPath $rootPath -CLSID $ClassId
+            if ($dll -eq "") {
+              $value = $ClassId
+            }
+            else {
+              $value = $dll
+            }
+          }
+
+          else {
+            $value = "Unknow"
+          }
+        }
+  
+        $PersistenceObject = New-PersistenceObject -Hostname $hostname -Technique 'Scheduled Task' -Classification 'MITRE ATT&CK T1053.005' -Path $propPath -Value $value -AccessGained $access -Note "Scheduled tasks run executables or actions when certain conditions, such as user log in or machine boot up, are met." -Reference 'https://attack.mitre.org/techniques/T1053/005/'
+        $null = $persistenceObjectArray.Add($PersistenceObject)
+  
       }
       Write-Verbose -Message ''
+  
     }
 
     function Get-BitsJobsNotifyCmdLine {
@@ -2468,11 +2620,6 @@ function Find-AllPersistence {
           Get-RDPWDSStartupPrograms
           break
         }
-        'ScheduledTasks' {
-          Get-ScheduledTasks
-          break
-        }
-
         'Screensaver' {
           Get-Screensaver
           break
